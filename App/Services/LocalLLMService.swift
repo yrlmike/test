@@ -30,10 +30,10 @@ actor LocalLLMService {
 
         // 切换模型前释放旧模型内存
         modelContainer = nil
-        MLX.GPU.clearCache()
+        Memory.clearCache()
 
-        // 限制 MLX GPU 缓存上限，防止 iOS 后台被杀
-        MLX.GPU.set(cacheLimit: 20 * 1024 * 1024)
+        // 限制 MLX 缓存上限为 20MB，防止 iOS 后台内存溢出被杀
+        Memory.cacheLimit = 20 * 1024 * 1024
 
         let config = ModelConfiguration(id: model.rawValue)
         let container = try await LLMModelFactory.shared.loadContainer(configuration: config) { progress in
@@ -56,18 +56,18 @@ actor LocalLLMService {
         \(question)
         """
 
-        let result = try await container.perform { context in
+        let result: GenerateResult = try await container.perform { context in
             let input = try await context.processor.prepare(input: .init(prompt: prompt))
             return try MLXLMCommon.generate(
                 input: input,
                 parameters: GenerateParameters(maxTokens: 300, temperature: 0.2, topP: 0.9),
                 context: context
-            ) { _ in
-                .more
+            ) { (tokens: [Int]) -> GenerateDisposition in
+                return tokens.count >= 300 ? .stop : .more
             }
         }
 
-        MLX.GPU.clearCache()
+        Memory.clearCache()
         return result.output.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 }
