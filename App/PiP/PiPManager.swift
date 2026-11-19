@@ -147,10 +147,19 @@ final class PiPManager: NSObject, ObservableObject {
             UIColor.systemBlue.setFill()
             ctx.fill(CGRect(x: 0, y: 0, width: size.width, height: 10))
 
-            let fontSize: CGFloat = text.count > 120 ? 32 : (text.count > 60 ? 38 : 46)
+            // 4 档动态字号：字越多字号自动调小，确保全部内容完整折行显示
+            let fontSize: CGFloat
+            switch text.count {
+            case 0...40: fontSize = 46
+            case 41...90: fontSize = 38
+            case 91...160: fontSize = 32
+            default: fontSize = 27
+            }
+
             let paragraph = NSMutableParagraphStyle()
-            paragraph.lineSpacing = 10
-            paragraph.lineBreakMode = .byTruncatingTail
+            paragraph.lineSpacing = 8
+            // 使用 byCharWrapping 确保长英文、数字或无空格文本也能在边缘精准自动换行
+            paragraph.lineBreakMode = .byCharWrapping
 
             let attrs: [NSAttributedString.Key: Any] = [
                 .font: UIFont.systemFont(ofSize: fontSize, weight: .bold),
@@ -158,8 +167,8 @@ final class PiPManager: NSObject, ObservableObject {
                 .paragraphStyle: paragraph
             ]
 
-            let textRect = CGRect(x: 40, y: 32, width: size.width - 80, height: size.height - 64)
-            (text as NSString).draw(in: textRect, withAttributes: attrs)
+            let textRect = CGRect(x: 36, y: 28, width: size.width - 72, height: size.height - 56)
+            (text as NSString).draw(with: textRect, options: [.usesLineFragmentOrigin, .usesFontLeading], attributes: attrs, context: nil)
         }
 
         guard let cgImage = image.cgImage else { return nil }
