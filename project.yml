@@ -1,0 +1,53 @@
+name: ScreenSolver
+options:
+  bundleIdPrefix: com.screensolver
+  deploymentTarget:
+    iOS: "17.0"
+  xcodeVersion: "16.0"
+
+packages:
+  mlx-swift-examples:
+    url: https://github.com/ml-explore/mlx-swift-examples
+    branch: main
+
+targets:
+  ScreenSolver:
+    type: application
+    platform: iOS
+    sources:
+      - path: App
+      - path: Shared
+    info:
+      path: App/Info.plist
+    entitlements:
+      path: App/ScreenSolver.entitlements
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.screensolver.app
+        INFOPLIST_FILE: App/Info.plist
+        CODE_SIGNING_ALLOWED: "NO"
+        CODE_SIGNING_REQUIRED: "NO"
+        ENABLE_BITCODE: "NO"
+    dependencies:
+      - target: ScreenSolverExtension
+      - package: mlx-swift-examples
+        product: MLXLLM
+      - package: mlx-swift-examples
+        product: MLXLMCommon
+
+  ScreenSolverExtension:
+    type: app-extension
+    platform: iOS
+    sources:
+      - path: Extension
+      - path: Shared
+    info:
+      path: Extension/Info.plist
+    entitlements:
+      path: Extension/ScreenSolverExtension.entitlements
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.screensolver.app.ScreenSolverExtension
+        INFOPLIST_FILE: Extension/Info.plist
+        CODE_SIGNING_ALLOWED: "NO"
+        CODE_SIGNING_REQUIRED: "NO"
