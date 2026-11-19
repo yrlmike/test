@@ -3,14 +3,21 @@ name: Build Unsigned iOS IPA
 on:
   push:
     branches: [ main ]
-  workflow_dispatch: # 允许你在 GitHub 网页上随时手动点击触发编译
+  workflow_dispatch:
 
 jobs:
   build:
     name: Build ScreenSolver IPA
-    runs-on: macos-15 # 使用 Apple Silicon (M1/M2) 云端 Runner，编译速度极快
+    runs-on: macos-15
 
     steps:
+      - name: 0. 切换至 Xcode 26 (支持 Swift 6.2)
+        run: |
+          XCODE_26=$(ls -d /Applications/Xcode_26*.app | sort -V | tail -n 1)
+          echo "Selected Xcode: $XCODE_26"
+          sudo xcode-select -s "$XCODE_26/Contents/Developer"
+          xcodebuild -version
+
       - name: 1. 拉取仓库代码
         uses: actions/checkout@v4
 
