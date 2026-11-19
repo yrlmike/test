@@ -2,6 +2,7 @@ import Foundation
 
 enum AppGroup {
     static let localPort: UInt16 = 45678
+    static let darwinNotificationName = "com.screensolver.newQuestion"
 
     static func writeQuestion(_ text: String) {
         guard let url = URL(string: "http://127.0.0.1:\(localPort)/question"),
