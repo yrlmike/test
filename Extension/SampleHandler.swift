@@ -23,7 +23,6 @@ class SampleHandler: RPBroadcastSampleHandler {
         guard sampleBufferType == .video else { return }
 
         let now = Date().timeIntervalSince1970
-        // 每 1.5 秒采样一次，避免后台 CPU/内存过载
         guard now - lastProcessTime >= 1.5, !isProcessing else { return }
         lastProcessTime = now
         isProcessing = true
@@ -33,7 +32,6 @@ class SampleHandler: RPBroadcastSampleHandler {
             return
         }
 
-        // 缩放至宽度 <= 1080px 保证速度与识别率
         let ciImage = CIImage(cvPixelBuffer: pixelBuffer)
         let width = ciImage.extent.width
         let scale = width > 1080 ? (1080.0 / width) : 1.0
@@ -56,21 +54,35 @@ class SampleHandler: RPBroadcastSampleHandler {
                   err == nil,
                   let observations = req.results as? [VNRecognizedTextObservation] else { return }
 
-            // 按屏幕从上到下排序（Vision 坐标系原点在左下角，boundingBox.midY 越大越靠上）
-            let sorted = observations.sorted { $0.boundingBox.midY > $1.boundingBox.midY }
-            let lines = sorted.compactMap { $0.topCandidates(1).first?.string }
-            let fullText = lines.joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
+            // 如果悬浮窗正处于“正在思考”阶段，暂缓新采样，避免打断当前推理
+            let rawLines = observations
+                .sorted { $0.boundingBox.midY > $1.boundingBox.midY }
+                .compactMap { $0.topCandidates(1).first?.string }
 
-            // 过滤掉无意义的短字符
-            guard fullText.count >= 4 else { return }
-
-            // 【优化 2】过滤画中画悬浮窗自身渲染的状态与答案文本，彻底防止“自己识别自己”循环触发
-            let selfKeywords = ["等待识别屏幕题目", "正在思考", "识别内容：", "本地模型", "推理出错"]
-            if selfKeywords.contains(where: { fullText.contains($0) }) {
+            if rawLines.contains(where: { $0.contains("正在思考") }) {
                 return
             }
 
-            // 防抖去重：若屏幕文字与上次发送高度相似，则不重复触发推理
+            // 逐行剔除悬浮窗自身的状态提示行，只保留真实的题目内容
+            let ignoredSubstrings = [
+                "等待识别屏幕题目",
+                "识别内容：",
+                "本地模型",
+                "已就绪",
+                "正在离线载入",
+                "推理出错",
+                "Qwen2.5"
+            ]
+            let cleanLines = rawLines.filter { line in
+                !ignoredSubstrings.contains(where: { line.contains($0) })
+            }
+
+            let fullText = cleanLines.joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
+
+            // 过滤掉无意义的短字符
+            guard fullText.count >= 3 else { return }
+
+            // 防抖去重：若题目内容未变化，不重复触发
             if self.isSimilar(fullText, to: self.lastSentText) {
                 return
             }
@@ -82,8 +94,6 @@ class SampleHandler: RPBroadcastSampleHandler {
         request.recognitionLevel = .accurate
         request.recognitionLanguages = ["zh-Hans", "en-US"]
         request.usesLanguageCorrection = true
-
-        // 【优化 1】裁掉屏幕最顶部 6.5% 的状态栏区域（Vision 坐标系左下角为 (0,0)，高度设为 0.935 即可避开时间、信号与电量）
         request.regionOfInterest = CGRect(x: 0.0, y: 0.0, width: 1.0, height: 0.935)
 
         let handler = VNImageRequestHandler(cgImage: cgImage, options: [:])
