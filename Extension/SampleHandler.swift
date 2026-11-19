@@ -4,16 +4,14 @@ import CoreImage
 
 class SampleHandler: RPBroadcastSampleHandler {
 
-    private var lastFrameTime: CFTimeInterval = 0
-    private let frameInterval: CFTimeInterval = 1.5
+    private var lastProcessTime: TimeInterval = 0
+    private var lastSentText: String = ""
+    private let ciContext = CIContext(options: nil)
     private let ocrQueue = DispatchQueue(label: "com.screensolver.ocr", qos: .userInitiated)
-    private let ciContext = CIContext(options: [.useSoftwareRenderer: false])
-    
-    private var lastRecognizedText: String = ""
     private var isProcessing = false
 
     override func broadcastStarted(withSetupInfo setupInfo: [String: NSObject]?) {
-        lastRecognizedText = ""
+        lastSentText = ""
         AppGroup.writeStatus("录屏已开启，正在监测屏幕...")
     }
 
@@ -23,85 +21,82 @@ class SampleHandler: RPBroadcastSampleHandler {
 
     override func processSampleBuffer(_ sampleBuffer: CMSampleBuffer, with sampleBufferType: RPSampleBufferType) {
         guard sampleBufferType == .video else { return }
-        guard !isProcessing else { return }
 
-        let now = CACurrentMediaTime()
-        guard now - lastFrameTime >= frameInterval else { return }
-        lastFrameTime = now
-
-        guard let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
+        let now = Date().timeIntervalSince1970
+        // 每 1.5 秒采样一次，避免后台 CPU/内存过载
+        guard now - lastProcessTime >= 1.5, !isProcessing else { return }
+        lastProcessTime = now
         isProcessing = true
+
+        guard let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else {
+            isProcessing = false
+            return
+        }
+
+        // 缩放至宽度 <= 1080px 保证速度与识别率
+        let ciImage = CIImage(cvPixelBuffer: pixelBuffer)
+        let width = ciImage.extent.width
+        let scale = width > 1080 ? (1080.0 / width) : 1.0
+        let scaledImage = scale < 1.0 ? ciImage.transformed(by: CGAffineTransform(scaleX: scale, y: scale)) : ciImage
+
+        guard let cgImage = ciContext.createCGImage(scaledImage, from: scaledImage.extent) else {
+            isProcessing = false
+            return
+        }
 
         ocrQueue.async { [weak self] in
             defer { self?.isProcessing = false }
-            self?.processFrame(pixelBuffer: pixelBuffer)
+            self?.performOCR(on: cgImage)
         }
     }
 
-    private func processFrame(pixelBuffer: CVPixelBuffer) {
-        // 1. 缩放图像至宽度 <= 1080，防止高分屏 OCR 触发 50MB 内存上限崩溃
-        let ciImage = CIImage(cvPixelBuffer: pixelBuffer)
-        let width = ciImage.extent.width
-        let targetWidth: CGFloat = 1080.0
-        let scaledImage: CIImage
-        if width > targetWidth {
-            let scale = targetWidth / width
-            scaledImage = ciImage.transformed(by: CGAffineTransform(scaleX: scale, y: scale))
-        } else {
-            scaledImage = ciImage
-        }
-
-        // 2. 配置 Vision OCR
-        let request = VNRecognizeTextRequest { [weak self] request, error in
+    private func performOCR(on cgImage: CGImage) {
+        let request = VNRecognizeTextRequest { [weak self] req, err in
             guard let self = self,
-                  error == nil,
-                  let observations = request.results as? [VNRecognizedTextObservation] else { return }
+                  err == nil,
+                  let observations = req.results as? [VNRecognizedTextObservation] else { return }
 
-            // 按屏幕从上到下排序（Vision 坐标系原点在左下角，故 y 越大越靠上）
-            let sorted = observations.sorted { $0.boundingBox.origin.y > $1.boundingBox.origin.y }
+            // 按屏幕从上到下排序（Vision 坐标系原点在左下角，boundingBox.midY 越大越靠上）
+            let sorted = observations.sorted { $0.boundingBox.midY > $1.boundingBox.midY }
             let lines = sorted.compactMap { $0.topCandidates(1).first?.string }
             let fullText = lines.joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
 
-            // 过滤过短的无效界面杂音
-            guard fullText.count >= 6 else { return }
+            // 过滤掉无意义的短字符
+            guard fullText.count >= 4 else { return }
 
-            // 3. 文本相似度去重：防止静止画面重复触发大模型推理
-            guard !self.isSimilar(text1: fullText, text2: self.lastRecognizedText) else { return }
-            self.lastRecognizedText = fullText
+            // 【优化 2】过滤画中画悬浮窗自身渲染的状态与答案文本，彻底防止“自己识别自己”循环触发
+            let selfKeywords = ["等待识别屏幕题目", "正在思考", "识别内容：", "本地模型", "推理出错"]
+            if selfKeywords.contains(where: { fullText.contains($0) }) {
+                return
+            }
 
-            // 4. 写入 App Group 并唤醒主 App
+            // 防抖去重：若屏幕文字与上次发送高度相似，则不重复触发推理
+            if self.isSimilar(fullText, to: self.lastSentText) {
+                return
+            }
+
+            self.lastSentText = fullText
             AppGroup.writeQuestion(fullText)
-            self.postDarwinNotification()
         }
 
         request.recognitionLevel = .accurate
         request.recognitionLanguages = ["zh-Hans", "en-US"]
         request.usesLanguageCorrection = true
 
-        let handler = VNImageRequestHandler(ciImage: scaledImage, options: [:])
+        // 【优化 1】裁掉屏幕最顶部 6.5% 的状态栏区域（Vision 坐标系左下角为 (0,0)，高度设为 0.935 即可避开时间、信号与电量）
+        request.regionOfInterest = CGRect(x: 0.0, y: 0.0, width: 1.0, height: 0.935)
+
+        let handler = VNImageRequestHandler(cgImage: cgImage, options: [:])
         try? handler.perform([request])
     }
 
-    private func isSimilar(text1: String, text2: String) -> Bool {
-        if text1 == text2 { return true }
-        if text2.isEmpty { return false }
-        let set1 = Set(text1)
-        let set2 = Set(text2)
-        let intersection = set1.intersection(set2).count
-        let union = set1.union(set2).count
-        guard union > 0 else { return false }
-        // 字符重合度超过 85% 视为同一道题/同一画面
+    private func isSimilar(_ a: String, to b: String) -> Bool {
+        if b.isEmpty { return false }
+        if a == b { return true }
+        let setA = Set(a)
+        let setB = Set(b)
+        let intersection = setA.intersection(setB).count
+        let union = max(setA.union(setB).count, 1)
         return Double(intersection) / Double(union) > 0.85
-    }
-
-    private func postDarwinNotification() {
-        let name = AppGroup.darwinNotificationName as CFString
-        CFNotificationCenterPostNotification(
-            CFNotificationCenterGetDarwinNotifyCenter(),
-            CFNotificationName(name),
-            nil,
-            nil,
-            true
-        )
     }
 }
