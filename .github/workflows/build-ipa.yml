@@ -1,0 +1,51 @@
+name: Build Unsigned iOS IPA
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch: # 允许你在 GitHub 网页上随时手动点击触发编译
+
+jobs:
+  build:
+    name: Build ScreenSolver IPA
+    runs-on: macos-15 # 使用 Apple Silicon (M1/M2) 云端 Runner，编译速度极快
+
+    steps:
+      - name: 1. 拉取仓库代码
+        uses: actions/checkout@v4
+
+      - name: 2. 安装 XcodeGen 并生成 Xcode 工程
+        run: |
+          brew install xcodegen
+          xcodegen generate
+
+      - name: 3. 解析 Swift Package 依赖 (MLX)
+        run: |
+          xcodebuild -resolvePackageDependencies \
+            -project ScreenSolver.xcodeproj \
+            -scheme ScreenSolver
+
+      - name: 4. 编译 Release 版无签名 .app
+        run: |
+          xcodebuild clean build \
+            -project ScreenSolver.xcodeproj \
+            -scheme ScreenSolver \
+            -configuration Release \
+            -sdk iphoneos \
+            -derivedDataPath build \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY=""
+
+      - name: 5. 打包成标准未签名 IPA
+        run: |
+          mkdir -p Payload
+          cp -r build/Build/Products/Release-iphoneos/ScreenSolver.app Payload/
+          zip -r -y ScreenSolver-Unsigned.ipa Payload
+
+      - name: 6. 上传 IPA 产物供下载
+        uses: actions/upload-artifact@v4
+        with:
+          name: ScreenSolver-Unsigned-IPA
+          path: ScreenSolver-Unsigned.ipa
+          retention-days: 7
