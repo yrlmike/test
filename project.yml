@@ -6,8 +6,8 @@ options:
   xcodeVersion: "16.0"
 
 packages:
-  mlx-swift-examples:
-    url: https://github.com/ml-explore/mlx-swift-examples
+  mlx-swift-lm:
+    url: https://github.com/ml-explore/mlx-swift-lm
     branch: main
 
 targets:
@@ -30,9 +30,9 @@ targets:
         ENABLE_BITCODE: "NO"
     dependencies:
       - target: ScreenSolverExtension
-      - package: mlx-swift-examples
+      - package: mlx-swift-lm
         product: MLXLLM
-      - package: mlx-swift-examples
+      - package: mlx-swift-lm
         product: MLXLMCommon
 
   ScreenSolverExtension:
