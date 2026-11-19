@@ -17,14 +17,13 @@ targets:
     sources:
       - path: App
       - path: Shared
-    info:
-      path: App/Info.plist
     entitlements:
       path: App/ScreenSolver.entitlements
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.screensolver.app
         INFOPLIST_FILE: App/Info.plist
+        GENERATE_INFOPLIST_FILE: "NO"
         CODE_SIGNING_ALLOWED: "NO"
         CODE_SIGNING_REQUIRED: "NO"
         ENABLE_BITCODE: "NO"
@@ -41,13 +40,12 @@ targets:
     sources:
       - path: Extension
       - path: Shared
-    info:
-      path: Extension/Info.plist
     entitlements:
       path: Extension/ScreenSolverExtension.entitlements
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.screensolver.app.ScreenSolverExtension
         INFOPLIST_FILE: Extension/Info.plist
+        GENERATE_INFOPLIST_FILE: "NO"
         CODE_SIGNING_ALLOWED: "NO"
         CODE_SIGNING_REQUIRED: "NO"
