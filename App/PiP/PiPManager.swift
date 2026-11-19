@@ -17,6 +17,19 @@ final class PiPManager: NSObject, ObservableObject {
     private override init() {
         super.init()
         displayLayer.videoGravity = .resizeAspect
+        
+        // 绑定主机实时时钟，防止直播流模式下首帧被系统丢弃导致黑屏
+        var timebase: CMTimebase?
+        CMTimebaseCreateWithSourceClock(
+            allocator: kCFAllocatorDefault,
+            sourceClock: CMClockGetHostTimeClock(),
+            timebaseOut: &timebase
+        )
+        if let timebase = timebase {
+            displayLayer.controlTimebase = timebase
+            CMTimebaseSetTime(timebase, time: CMClockGetTime(CMClockGetHostTimeClock()))
+            CMTimebaseSetRate(timebase, rate: 1.0)
+        }
     }
 
     func setupAudioAndPiP() {
@@ -102,11 +115,11 @@ final class PiPManager: NSObject, ObservableObject {
         let size = CGSize(width: 960, height: 540)
         let renderer = UIGraphicsImageRenderer(size: size)
         let image = renderer.image { ctx in
-            // 深色半透明质感背景
+            // 深色背景
             UIColor(red: 0.08, green: 0.09, blue: 0.11, alpha: 1.0).setFill()
             ctx.fill(CGRect(origin: .zero, size: size))
 
-            // 顶部状态栏装饰条
+            // 顶部蓝色状态装饰条
             UIColor.systemBlue.setFill()
             ctx.fill(CGRect(x: 0, y: 0, width: size.width, height: 8))
 
@@ -184,6 +197,18 @@ final class PiPManager: NSObject, ObservableObject {
             sampleTiming: &timing,
             sampleBufferOut: &sampleBuffer
         )
+
+        // 强制标记为立即显示，彻底解决首帧及更新帧黑屏问题
+        if let sb = sampleBuffer,
+           let attachments = CMSampleBufferGetSampleAttachmentsArray(sb, createIfNecessary: true) {
+            let dict = unsafeBitCast(CFArrayGetValueAtIndex(attachments, 0), to: CFMutableDictionary.self)
+            CFDictionarySetValue(
+                dict,
+                Unmanaged.passUnretained(kCMSampleAttachmentKey_DisplayImmediately).toOpaque(),
+                Unmanaged.passUnretained(kCFBooleanTrue).toOpaque()
+            )
+        }
+
         return sampleBuffer
     }
 }
