@@ -1,5 +1,6 @@
 import Foundation
 import SwiftUI
+import Network
 
 @MainActor
 final class SolverViewModel: ObservableObject {
@@ -19,7 +20,7 @@ final class SolverViewModel: ObservableObject {
     @Published var modelDownloadProgress: Double = 0.0
     @Published var isDownloadingModel: Bool = false
 
-    private var lastHandledTimestamp: TimeInterval = 0
+    private var listener: NWListener?
     private var currentTask: Task<Void, Never>?
 
     var selectedLocalModel: LocalLLMService.AvailableModel {
@@ -28,32 +29,47 @@ final class SolverViewModel: ObservableObject {
     }
 
     private init() {
-        registerDarwinObserver()
+        startLocalServer()
     }
 
-    private func registerDarwinObserver() {
-        let name = AppGroup.darwinNotificationName as CFString
-        CFNotificationCenterAddObserver(
-            CFNotificationCenterGetDarwinNotifyCenter(),
-            nil,
-            { _, _, _, _, _ in
-                Task { @MainActor in
-                    SolverViewModel.shared.handleNewQuestionFromExtension()
+    // 启动本地 127.0.0.1:45678 端口接收扩展传来的 OCR 文本
+    private func startLocalServer() {
+        guard listener == nil else { return }
+        do {
+            let params = NWParameters.tcp
+            params.allowLocalEndpointReuse = true
+            let port = NWEndpoint.Port(rawValue: AppGroup.localPort)!
+            let newListener = try NWListener(using: params, on: port)
+
+            newListener.newConnectionHandler = { connection in
+                connection.start(queue: .global(qos: .userInitiated))
+                connection.receive(minimumIncompleteLength: 1, maximumLength: 65536) { data, _, _, _ in
+                    defer { connection.cancel() }
+                    guard let data = data,
+                          let rawString = String(data: data, encoding: .utf8) else { return }
+
+                    // 解析 HTTP POST Body（空行 \r\n\r\n 之后即为识别出的题目文本）
+                    let parts = rawString.components(separatedBy: "\r\n\r\n")
+                    let bodyText = (parts.count > 1 ? parts.dropFirst().joined(separator: "\r\n\r\n") : "")
+                        .trimmingCharacters(in: .whitespacesAndNewlines)
+
+                    // 立即回复 200 OK 给扩展，防止扩展连接挂起
+                    let response = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK"
+                    connection.send(content: response.data(using: .utf8), completion: .contentProcessed({ _ in }))
+
+                    guard !bodyText.isEmpty else { return }
+                    Task { @MainActor in
+                        SolverViewModel.shared.recognizedQuestion = bodyText
+                        SolverViewModel.shared.solve(question: bodyText)
+                    }
                 }
-            },
-            name,
-            nil,
-            .deliverImmediately
-        )
-    }
+            }
 
-    func handleNewQuestionFromExtension() {
-        guard let item = AppGroup.readQuestion() else { return }
-        guard item.timestamp > lastHandledTimestamp else { return }
-        lastHandledTimestamp = item.timestamp
-
-        recognizedQuestion = item.text
-        solve(question: item.text)
+            newListener.start(queue: .global(qos: .userInitiated))
+            self.listener = newListener
+        } catch {
+            self.answerText = "本地接收服务启动失败: \(error.localizedDescription)"
+        }
     }
 
     func preloadLocalModel() {
@@ -91,7 +107,6 @@ final class SolverViewModel: ObservableObject {
             do {
                 let result: String
                 if useLocalMLX || apiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                    // 走本地 MLX 离线推理
                     result = try await LocalLLMService.shared.answer(
                         question: question,
                         model: selectedLocalModel
@@ -106,7 +121,6 @@ final class SolverViewModel: ObservableObject {
                         }
                     }
                 } else {
-                    // 走云端 API
                     let cfg = APIService.Config(
                         baseURL: apiBaseURL,
                         apiKey: apiKey,
