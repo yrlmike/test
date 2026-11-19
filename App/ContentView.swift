@@ -10,7 +10,7 @@ struct ContentView: View {
             ZStack {
                 // 隐形 PiP 视频层（必须存在于屏幕视图层级中，大小为 1x1 像素）
                 PiPHostView()
-                    .frame(width: 1, height: 1)
+                    .frame(width: 320, height:180)
                     .opacity(0.01)
 
                 Form {
