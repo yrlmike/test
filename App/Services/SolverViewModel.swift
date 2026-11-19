@@ -10,12 +10,11 @@ final class SolverViewModel: ObservableObject {
     @Published var answerText: String = "等待识别屏幕题目..."
     @Published var isThinking: Bool = false
 
-    // 引擎设置（自动持久化到 UserDefaults）
     @AppStorage("useLocalMLX") var useLocalMLX: Bool = false
     @AppStorage("selectedLocalModel") var selectedLocalModelRaw: String = LocalLLMService.AvailableModel.qwen1_5B.rawValue
-    @AppStorage("apiBaseURL") var apiBaseURL: String = "https://api.deepseek.com/v1"
+    @AppStorage("apiBaseURL") var apiBaseURL: String = "https://tokenhub.tencentmaas.com/v1"
     @AppStorage("apiKey") var apiKey: String = ""
-    @AppStorage("apiModelName") var apiModelName: String = "deepseek-chat"
+    @AppStorage("apiModelName") var apiModelName: String = "deepseek/deepseek-flash"
 
     @Published var modelDownloadProgress: Double = 0.0
     @Published var isDownloadingModel: Bool = false
@@ -29,10 +28,16 @@ final class SolverViewModel: ObservableObject {
     }
 
     private init() {
+        // 注入国内镜像站地址，首次下载新模型也无需 VPN
+        setenv("HF_ENDPOINT", "https://hf-mirror.com", 1)
         startLocalServer()
+
+        // 若开启了本地模型且硬盘里已下载缓存，启动时自动静默载入内存，免去每次手动点击
+        if useLocalMLX, LocalLLMService.shared.localCachedDirectory(for: selectedLocalModel) != nil {
+            preloadLocalModel()
+        }
     }
 
-    // 启动本地 127.0.0.1:45678 端口接收扩展传来的 OCR 文本
     private func startLocalServer() {
         guard listener == nil else { return }
         do {
@@ -48,12 +53,10 @@ final class SolverViewModel: ObservableObject {
                     guard let data = data,
                           let rawString = String(data: data, encoding: .utf8) else { return }
 
-                    // 解析 HTTP POST Body（空行 \r\n\r\n 之后即为识别出的题目文本）
                     let parts = rawString.components(separatedBy: "\r\n\r\n")
                     let bodyText = (parts.count > 1 ? parts.dropFirst().joined(separator: "\r\n\r\n") : "")
                         .trimmingCharacters(in: .whitespacesAndNewlines)
 
-                    // 立即回复 200 OK 给扩展，防止扩展连接挂起
                     let response = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK"
                     connection.send(content: response.data(using: .utf8), completion: .contentProcessed({ _ in }))
 
@@ -75,7 +78,7 @@ final class SolverViewModel: ObservableObject {
     func preloadLocalModel() {
         isDownloadingModel = true
         modelDownloadProgress = 0.0
-        answerText = "正在加载/下载本地 MLX 模型..."
+        answerText = "正在离线载入本地 MLX 模型..."
         PiPManager.shared.updateText(answerText)
 
         Task {
