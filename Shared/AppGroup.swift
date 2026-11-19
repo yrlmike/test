@@ -1,15 +1,20 @@
 import Foundation
+import Security
 
 enum AppGroup {
-    // ⚠️ 务必修改为你自己在 Xcode Signing & Capabilities 里填写的 App Group ID
-    static let id = "group.com.screensolver.shared"
-    
     static let darwinNotificationName = "com.screensolver.newQuestion"
-    
     private static let questionKey = "latest_question"
     private static let questionTimeKey = "latest_question_ts"
-    private static let answerKey = "latest_answer"
-    private static let statusKey = "solver_status"
+
+    // 自动探测当前签名实际拥有的第一个 App Group ID，探测不到则回退默认值
+    static let id: String = {
+        if let task = SecTaskCreateFromSelf(nil),
+           let val = SecTaskCopyValueForEntitlement(task, "com.apple.security.application-groups" as CFString, nil) as? [String],
+           let first = val.first, !first.isEmpty {
+            return first
+        }
+        return "group.com.screensolver.shared"
+    }()
 
     static var defaults: UserDefaults? {
         UserDefaults(suiteName: id)
@@ -25,13 +30,5 @@ enum AppGroup {
         guard let text = defaults?.string(forKey: questionKey), !text.isEmpty else { return nil }
         let ts = defaults?.double(forKey: questionTimeKey) ?? 0
         return (text, ts)
-    }
-
-    static func writeStatus(_ status: String) {
-        defaults?.set(status, forKey: statusKey)
-    }
-
-    static func readStatus() -> String {
-        defaults?.string(forKey: statusKey) ?? "等待屏幕内容..."
     }
 }
