@@ -9,31 +9,21 @@ final class PiPManager: NSObject, ObservableObject {
     @Published var isPiPActive = false
     @Published var statusMessage = "PiP 未启动"
 
-    let displayLayer = AVSampleBufferDisplayLayer()
+    let player = AVPlayer()
+    let playerLayer = AVPlayerLayer()
     private var pipController: AVPictureInPictureController?
-    private var heartbeatTimer: Timer?
+    private var loopObserver: Any?
     private var currentText: String = "等待识别屏幕题目..."
+    private var renderCounter: Int = 0
 
     private override init() {
         super.init()
-        displayLayer.videoGravity = .resizeAspect
-        
-        // 绑定主机实时时钟，防止直播流模式下首帧被系统丢弃导致黑屏
-        var timebase: CMTimebase?
-        CMTimebaseCreateWithSourceClock(
-            allocator: kCFAllocatorDefault,
-            sourceClock: CMClockGetHostTimeClock(),
-            timebaseOut: &timebase
-        )
-        if let timebase = timebase {
-            displayLayer.controlTimebase = timebase
-            CMTimebaseSetTime(timebase, time: CMClockGetTime(CMClockGetHostTimeClock()))
-            CMTimebaseSetRate(timebase, rate: 1.0)
-        }
+        playerLayer.player = player
+        playerLayer.videoGravity = .resizeAspect
+        player.isMuted = true
     }
 
     func setupAudioAndPiP() {
-        // 1. 激活混合播放音频会话（后台维持 PiP 存活的关键）
         do {
             let session = AVAudioSession.sharedInstance()
             try session.setCategory(.playback, mode: .moviePlayback, options: [.mixWithOthers])
@@ -42,34 +32,26 @@ final class PiPManager: NSObject, ObservableObject {
             statusMessage = "音频会话失败: \(error.localizedDescription)"
         }
 
-        // 2. 初始化 PiP 控制器
         guard AVPictureInPictureController.isPictureInPictureSupported() else {
             statusMessage = "当前设备不支持画中画"
             return
         }
 
         if pipController == nil {
-            let contentSource = AVPictureInPictureController.ContentSource(
-                sampleBufferDisplayLayer: displayLayer,
-                playbackDelegate: self
-            )
-            let controller = AVPictureInPictureController(contentSource: contentSource)
-            controller.delegate = self
-            // 隐藏快进快退按钮，界面更干净
-            controller.requiresLinearPlayback = true
+            let controller = AVPictureInPictureController(playerLayer: playerLayer)
+            controller?.delegate = self
+            controller?.requiresLinearPlayback = true
             self.pipController = controller
         }
 
-        // 预渲染首帧，防止启动 PiP 时黑屏
-        pushFrame(text: currentText)
+        updateText(currentText)
     }
 
     func startPiP() {
         setupAudioAndPiP()
-        pushFrame(text: currentText)
+        player.play()
 
-        // 延迟 0.15s 确保首帧已进入解码队列后再拉起画中画
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { [weak self] in
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in
             guard let self = self else { return }
             if self.pipController?.isPictureInPictureActive == false {
                 self.pipController?.startPictureInPicture()
@@ -79,89 +61,124 @@ final class PiPManager: NSObject, ObservableObject {
 
     func stopPiP() {
         pipController?.stopPictureInPicture()
-        stopHeartbeat()
+        player.pause()
     }
 
     func updateText(_ text: String) {
         currentText = text
-        pushFrame(text: text)
-    }
+        renderCounter += 1
+        let index = renderCounter
 
-    private func startHeartbeat() {
-        stopHeartbeat()
-        // 1fps 低功耗维持帧缓冲活跃
-        heartbeatTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
-            guard let self = self else { return }
-            self.pushFrame(text: self.currentText)
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            guard let self = self,
+                  let videoURL = self.generateTextVideo(text: text, index: index) else { return }
+
+            DispatchQueue.main.async {
+                if let observer = self.loopObserver {
+                    NotificationCenter.default.removeObserver(observer)
+                }
+                let item = AVPlayerItem(url: videoURL)
+                self.player.replaceCurrentItem(with: item)
+                self.player.play()
+
+                // 无限循环播放该文字帧视频
+                self.loopObserver = NotificationCenter.default.addObserver(
+                    forName: .AVPlayerItemDidPlayToEndTime,
+                    object: item,
+                    queue: .main
+                ) { [weak self] _ in
+                    self?.player.seek(to: .zero)
+                    self?.player.play()
+                }
+            }
         }
     }
 
-    private func stopHeartbeat() {
-        heartbeatTimer?.invalidate()
-        heartbeatTimer = nil
-    }
-
-    private func pushFrame(text: String) {
-        if displayLayer.status == .failed {
-            displayLayer.flush()
-        }
-        guard let pixelBuffer = makeTextPixelBuffer(text: text),
-              let sampleBuffer = makeSampleBuffer(from: pixelBuffer) else { return }
-        displayLayer.enqueue(sampleBuffer)
-    }
-
-    private func makeTextPixelBuffer(text: String) -> CVPixelBuffer? {
-        // 宽屏比例最适合 iPhone 悬浮窗阅读
+    private func generateTextVideo(text: String, index: Int) -> URL? {
         let size = CGSize(width: 960, height: 540)
+        let tempDir = FileManager.default.temporaryDirectory
+        // 轮流使用两个文件名，防止正在播放时被覆盖
+        let fileURL = tempDir.appendingPathComponent("pip_frame_\(index % 2).mp4")
+        try? FileManager.default.removeItem(at: fileURL)
+
+        guard let writer = try? AVAssetWriter(outputURL: fileURL, fileType: .mp4) else { return nil }
+        let settings: [String: Any] = [
+            AVVideoCodecKey: AVVideoCodecType.h264,
+            AVVideoWidthKey: Int(size.width),
+            AVVideoHeightKey: Int(size.height)
+        ]
+        let input = AVAssetWriterInput(mediaType: .video, outputSettings: settings)
+        let adaptor = AVAssetWriterInputPixelBufferAdaptor(
+            assetWriterInput: input,
+            sourcePixelBufferAttributes: [
+                kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
+                kCVPixelBufferWidthKey as String: Int(size.width),
+                kCVPixelBufferHeightKey as String: Int(size.height)
+            ]
+        )
+
+        writer.add(input)
+        writer.startWriting()
+        writer.startSession(atSourceTime: .zero)
+
+        guard let buffer = makeTextPixelBuffer(text: text, size: size) else { return nil }
+
+        // 写入 2 帧构成 1 秒视频
+        while !input.isReadyForMoreMediaData { Thread.sleep(forTimeInterval: 0.01) }
+        adaptor.append(buffer, withPresentationTime: .zero)
+
+        while !input.isReadyForMoreMediaData { Thread.sleep(forTimeInterval: 0.01) }
+        adaptor.append(buffer, withPresentationTime: CMTime(value: 1, timescale: 1))
+
+        input.markAsFinished()
+        let semaphore = DispatchSemaphore(value: 0)
+        writer.finishWriting { semaphore.signal() }
+        semaphore.wait()
+
+        return writer.status == .completed ? fileURL : nil
+    }
+
+    private func makeTextPixelBuffer(text: String, size: CGSize) -> CVPixelBuffer? {
         let renderer = UIGraphicsImageRenderer(size: size)
         let image = renderer.image { ctx in
-            // 深色背景
-            UIColor(red: 0.08, green: 0.09, blue: 0.11, alpha: 1.0).setFill()
+            UIColor(red: 0.09, green: 0.10, blue: 0.13, alpha: 1.0).setFill()
             ctx.fill(CGRect(origin: .zero, size: size))
 
-            // 顶部蓝色状态装饰条
             UIColor.systemBlue.setFill()
-            ctx.fill(CGRect(x: 0, y: 0, width: size.width, height: 8))
+            ctx.fill(CGRect(x: 0, y: 0, width: size.width, height: 10))
 
-            // 自动根据字数微调字号，保证小窗看得清
-            let fontSize: CGFloat = text.count > 120 ? 30 : (text.count > 60 ? 36 : 42)
+            let fontSize: CGFloat = text.count > 120 ? 32 : (text.count > 60 ? 38 : 46)
             let paragraph = NSMutableParagraphStyle()
-            paragraph.lineSpacing = 8
+            paragraph.lineSpacing = 10
             paragraph.lineBreakMode = .byTruncatingTail
 
             let attrs: [NSAttributedString.Key: Any] = [
-                .font: UIFont.systemFont(ofSize: fontSize, weight: .semibold),
+                .font: UIFont.systemFont(ofSize: fontSize, weight: .bold),
                 .foregroundColor: UIColor.white,
                 .paragraphStyle: paragraph
             ]
 
-            let textRect = CGRect(x: 36, y: 28, width: size.width - 72, height: size.height - 56)
+            let textRect = CGRect(x: 40, y: 32, width: size.width - 80, height: size.height - 64)
             (text as NSString).draw(in: textRect, withAttributes: attrs)
         }
 
         guard let cgImage = image.cgImage else { return nil }
-
         var pb: CVPixelBuffer?
-        let options: [CFString: Any] = [
-            kCVPixelBufferCGImageCompatibilityKey: true,
-            kCVPixelBufferCGBitmapContextCompatibilityKey: true
-        ]
         CVPixelBufferCreate(
             kCFAllocatorDefault,
             Int(size.width),
             Int(size.height),
             kCVPixelFormatType_32BGRA,
-            options as CFDictionary,
+            [kCVPixelBufferCGImageCompatibilityKey: true, kCVPixelBufferCGBitmapContextCompatibilityKey: true] as CFDictionary,
             &pb
         )
         guard let buffer = pb else { return nil }
-
         CVPixelBufferLockBaseAddress(buffer, [])
         defer { CVPixelBufferUnlockBaseAddress(buffer, []) }
 
-        guard let baseAddress = CVPixelBufferGetBaseAddress(buffer),
+        guard let base = CVPixelBufferGetBaseAddress(buffer),
               let context = CGContext(
-                data: baseAddress,
+                data: base,
                 width: Int(size.width),
                 height: Int(size.height),
                 bitsPerComponent: 8,
@@ -173,44 +190,6 @@ final class PiPManager: NSObject, ObservableObject {
         context.draw(cgImage, in: CGRect(origin: .zero, size: size))
         return buffer
     }
-
-    private func makeSampleBuffer(from pixelBuffer: CVPixelBuffer) -> CMSampleBuffer? {
-        var formatDesc: CMFormatDescription?
-        CMVideoFormatDescriptionCreateForImageBuffer(
-            allocator: kCFAllocatorDefault,
-            imageBuffer: pixelBuffer,
-            formatDescriptionOut: &formatDesc
-        )
-        guard let format = formatDesc else { return nil }
-
-        var timing = CMSampleTimingInfo(
-            duration: CMTime(value: 1, timescale: 30),
-            presentationTimeStamp: CMClockGetTime(CMClockGetHostTimeClock()),
-            decodeTimeStamp: .invalid
-        )
-
-        var sampleBuffer: CMSampleBuffer?
-        CMSampleBufferCreateReadyWithImageBuffer(
-            allocator: kCFAllocatorDefault,
-            imageBuffer: pixelBuffer,
-            formatDescription: format,
-            sampleTiming: &timing,
-            sampleBufferOut: &sampleBuffer
-        )
-
-        // 强制标记为立即显示，彻底解决首帧及更新帧黑屏问题
-        if let sb = sampleBuffer,
-           let attachments = CMSampleBufferGetSampleAttachmentsArray(sb, createIfNecessary: true) {
-            let dict = unsafeBitCast(CFArrayGetValueAtIndex(attachments, 0), to: CFMutableDictionary.self)
-            CFDictionarySetValue(
-                dict,
-                Unmanaged.passUnretained(kCMSampleAttachmentKey_DisplayImmediately).toOpaque(),
-                Unmanaged.passUnretained(kCFBooleanTrue).toOpaque()
-            )
-        }
-
-        return sampleBuffer
-    }
 }
 
 extension PiPManager: AVPictureInPictureControllerDelegate {
@@ -218,7 +197,6 @@ extension PiPManager: AVPictureInPictureControllerDelegate {
         DispatchQueue.main.async {
             self.isPiPActive = true
             self.statusMessage = "画中画运行中"
-            self.startHeartbeat()
         }
     }
 
@@ -226,38 +204,16 @@ extension PiPManager: AVPictureInPictureControllerDelegate {
         DispatchQueue.main.async {
             self.isPiPActive = false
             self.statusMessage = "画中画已关闭"
-            self.stopHeartbeat()
-        }
-    }
-
-    func pictureInPictureController(_ pictureInPictureController: AVPictureInPictureController, failedToStartPictureInPictureWithError error: Error) {
-        DispatchQueue.main.async {
-            self.isPiPActive = false
-            self.statusMessage = "启动失败: \(error.localizedDescription)"
         }
     }
 }
 
-extension PiPManager: AVPictureInPictureSampleBufferPlaybackDelegate {
-    func pictureInPictureController(_ pictureInPictureController: AVPictureInPictureController, setPlaying playing: Bool) {}
-    func pictureInPictureControllerTimeRangeForPlayback(_ pictureInPictureController: AVPictureInPictureController) -> CMTimeRange {
-        CMTimeRange(start: .zero, duration: .positiveInfinity)
-    }
-    func pictureInPictureControllerIsPlaybackPaused(_ pictureInPictureController: AVPictureInPictureController) -> Bool {
-        false
-    }
-    func pictureInPictureController(_ pictureInPictureController: AVPictureInPictureController, didTransitionToRenderSize newRenderSize: CMVideoDimensions) {}
-    func pictureInPictureController(_ pictureInPictureController: AVPictureInPictureController, skipByInterval skipInterval: CMTime, completion completionHandler: @escaping () -> Void) {
-        completionHandler()
-    }
-}
-
-// MARK: - 必须挂载到 SwiftUI 视图层级中的宿主 View
+// MARK: - 挂载 AVPlayerLayer 的宿主 View
 struct PiPHostView: UIViewRepresentable {
     func makeUIView(context: Context) -> LayerContainerView {
         let view = LayerContainerView()
         view.backgroundColor = .clear
-        let layer = PiPManager.shared.displayLayer
+        let layer = PiPManager.shared.playerLayer
         view.layer.addSublayer(layer)
         view.hostedLayer = layer
         return view
