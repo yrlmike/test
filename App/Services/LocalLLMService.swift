@@ -2,7 +2,72 @@ import Foundation
 import MLX
 import MLXLLM
 import MLXLMCommon
-import Hub
+
+/// 实时监听大文件下载字节进度的代理类
+private final class FileDownloadDelegate: NSObject, URLSessionDownloadDelegate {
+    private let onProgress: @Sendable (Double) -> Void
+    private var continuation: CheckedContinuation<(URL, URLResponse), Error>?
+
+    init(onProgress: @escaping @Sendable (Double) -> Void) {
+        self.onProgress = onProgress
+    }
+
+    func download(from url: URL) async throws -> (URL, URLResponse) {
+        return try await withCheckedThrowingContinuation { continuation in
+            self.continuation = continuation
+            let config = URLSessionConfiguration.default
+            config.timeoutIntervalForRequest = 30
+            config.timeoutIntervalForResource = 3600
+            let session = URLSession(configuration: config, delegate: self, delegateQueue: nil)
+            let task = session.downloadTask(with: url)
+            task.resume()
+        }
+    }
+
+    func urlSession(
+        _ session: URLSession,
+        downloadTask: URLSessionDownloadTask,
+        didWriteData bytesWritten: Int64,
+        totalBytesWritten: Int64,
+        totalBytesExpectedToWrite: Int64
+    ) {
+        guard totalBytesExpectedToWrite > 0 else { return }
+        let fraction = Double(totalBytesWritten) / Double(totalBytesExpectedToWrite)
+        onProgress(min(max(fraction, 0.0), 1.0))
+    }
+
+    func urlSession(
+        _ session: URLSession,
+        downloadTask: URLSessionDownloadTask,
+        didFinishDownloadingTo location: URL
+    ) {
+        // 必须同步把临时文件移走，否则代理方法返回后系统会立即删除 location
+        let fm = FileManager.default
+        let safeTemp = fm.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        do {
+            try fm.moveItem(at: location, to: safeTemp)
+            guard let response = downloadTask.response else {
+                continuation?.resume(throwing: URLError(.badServerResponse))
+                continuation = nil
+                return
+            }
+            continuation?.resume(returning: (safeTemp, response))
+            continuation = nil
+        } catch {
+            continuation?.resume(throwing: error)
+            continuation = nil
+        }
+        session.finishTasksAndInvalidate()
+    }
+
+    func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
+        if let error = error {
+            continuation?.resume(throwing: error)
+            continuation = nil
+            session.finishTasksAndInvalidate()
+        }
+    }
+}
 
 actor LocalLLMService {
     static let shared = LocalLLMService()
@@ -18,48 +83,129 @@ actor LocalLLMService {
             case .qwen3B: return "Qwen2.5-3B (高精版 ~1.8GB)"
             }
         }
+
+        var requiredFiles: [String] {
+            [
+                "config.json",
+                "tokenizer.json",
+                "tokenizer_config.json",
+                "model.safetensors"
+            ]
+        }
     }
 
     private var loadedContainer: ModelContainer?
     private var loadedModelID: String?
 
-    /// 检查本地缓存中是否已完整下载过模型文件（含 config.json 与 safetensors 权重）
+    /// 专用的持久化本地模型目录：Documents/MLXModels/<模型文件夹>
+    nonisolated func dedicatedModelDirectory(for model: AvailableModel) -> URL {
+        let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first!
+        let folderName = model.rawValue.replacingOccurrences(of: "/", with: "_")
+        return docs.appendingPathComponent("MLXModels").appendingPathComponent(folderName)
+    }
+
+    /// 严格校验本地模型是否完整（必须包含 config.json、tokenizer.json 且权重文件 > 500MB）
     nonisolated func localCachedDirectory(for model: AvailableModel) -> URL? {
         let fm = FileManager.default
-        let searchRoots = [
-            fm.urls(for: .cachesDirectory, in: .userDomainMask).first,
-            fm.urls(for: .documentDirectory, in: .userDomainMask).first
-        ].compactMap { $0 }
-
-        let repoFolderName = "models--" + model.rawValue.replacingOccurrences(of: "/", with: "--")
-
-        for root in searchRoots {
-            // 路径形态 1：Hub 默认缓存结构 .../huggingface/hub/models--mlx-community--.../snapshots/<hash>/
-            let snapshotsDir = root
-                .appendingPathComponent("huggingface/hub")
-                .appendingPathComponent(repoFolderName)
-                .appendingPathComponent("snapshots")
-
-            if let hashes = try? fm.contentsOfDirectory(at: snapshotsDir, includingPropertiesForKeys: nil) {
-                for dir in hashes {
-                    let configExists = fm.fileExists(atPath: dir.appendingPathComponent("config.json").path)
-                    let files = (try? fm.contentsOfDirectory(atPath: dir.path)) ?? []
-                    let hasWeights = files.contains { $0.hasSuffix(".safetensors") }
-                    if configExists && hasWeights {
-                        return dir
-                    }
-                }
-            }
-
-            // 路径形态 2：直接按 repo id 存放的目录 .../huggingface/models/mlx-community/Qwen...
-            let directDir = root
+        let candidateDirs = [
+            dedicatedModelDirectory(for: model),
+            fm.urls(for: .cachesDirectory, in: .userDomainMask).first?
                 .appendingPathComponent("huggingface/models")
                 .appendingPathComponent(model.rawValue)
-            if fm.fileExists(atPath: directDir.appendingPathComponent("config.json").path) {
-                return directDir
+        ].compactMap { $0 }
+
+        for dir in candidateDirs {
+            if isDirectoryValid(dir) {
+                return dir
+            }
+        }
+
+        if let caches = fm.urls(for: .cachesDirectory, in: .userDomainMask).first {
+            let repoFolder = "models--" + model.rawValue.replacingOccurrences(of: "/", with: "--")
+            let snapshots = caches.appendingPathComponent("huggingface/hub/\(repoFolder)/snapshots")
+            if let hashes = try? fm.contentsOfDirectory(at: snapshots, includingPropertiesForKeys: nil) {
+                for dir in hashes where isDirectoryValid(dir) {
+                    return dir
+                }
             }
         }
         return nil
+    }
+
+    nonisolated private func isDirectoryValid(_ dir: URL) -> Bool {
+        let fm = FileManager.default
+        let configOK = fm.fileExists(atPath: dir.appendingPathComponent("config.json").path)
+        let tokenizerOK = fm.fileExists(atPath: dir.appendingPathComponent("tokenizer.json").path)
+        guard configOK && tokenizerOK else { return false }
+
+        guard let files = try? fm.contentsOfDirectory(at: dir, includingPropertiesForKeys: [.fileSizeKey]) else {
+            return false
+        }
+        var totalWeightBytes: Int64 = 0
+        for file in files where file.pathExtension == "safetensors" {
+            let size = (try? file.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
+            totalWeightBytes += Int64(size)
+        }
+        return totalWeightBytes > 500 * 1024 * 1024
+    }
+
+    /// 绕开 Hub 元数据校验，直接从国内镜像站下载模型文件，并排除 iCloud 备份 + 按字节刷新进度条
+    private func downloadModelDirectly(_ model: AvailableModel, onProgress: @escaping @Sendable (Double) -> Void) async throws -> URL {
+        let fm = FileManager.default
+        let docs = fm.urls(for: .documentDirectory, in: .userDomainMask).first!
+        let rootModelsDir = docs.appendingPathComponent("MLXModels")
+        let targetDir = dedicatedModelDirectory(for: model)
+
+        if fm.fileExists(atPath: targetDir.path) {
+            try? fm.removeItem(at: targetDir)
+        }
+        try fm.createDirectory(at: targetDir, withIntermediateDirectories: true)
+
+        // ✅ 标记整个 MLXModels 目录排除在 iCloud 备份之外，不占用云盘空间
+        var resourceValues = URLResourceValues()
+        resourceValues.isExcludedFromBackup = true
+        var mutableRoot = rootModelsDir
+        var mutableTarget = targetDir
+        try? mutableRoot.setResourceValues(resourceValues)
+        try? mutableTarget.setResourceValues(resourceValues)
+
+        let mirrorBase = "https://hf-mirror.com/\(model.rawValue)/resolve/main"
+        let files = model.requiredFiles
+
+        for (index, fileName) in files.enumerated() {
+            guard let fileURL = URL(string: "\(mirrorBase)/\(fileName)") else { continue }
+            let destURL = targetDir.appendingPathComponent(fileName)
+
+            let (tempURL, response): (URL, URLResponse)
+            if fileName.hasSuffix(".safetensors") {
+                // ✅ 大权重文件使用带字节进度的下载器，平滑映射 5% -> 90% 区间
+                let downloader = FileDownloadDelegate { fileFraction in
+                    let mappedProgress = 0.05 + fileFraction * 0.85
+                    onProgress(mappedProgress)
+                }
+                (tempURL, response) = try await downloader.download(from: fileURL)
+            } else {
+                // 小配置文件直接下载，占前 5% 进度
+                (tempURL, response) = try await URLSession.shared.download(from: fileURL)
+                let smallStep = Double(index + 1) / 3.0 * 0.05
+                onProgress(min(smallStep, 0.05))
+            }
+
+            if let httpResp = response as? HTTPURLResponse, !(200...299).contains(httpResp.statusCode) {
+                try? fm.removeItem(at: tempURL)
+                throw NSError(
+                    domain: "LocalLLM",
+                    code: httpResp.statusCode,
+                    userInfo: [NSLocalizedDescriptionKey: "下载 \(fileName) 失败 (HTTP \(httpResp.statusCode))"]
+                )
+            }
+            if fm.fileExists(atPath: destURL.path) {
+                try fm.removeItem(at: destURL)
+            }
+            try fm.moveItem(at: tempURL, to: destURL)
+        }
+
+        return targetDir
     }
 
     func loadModel(_ model: AvailableModel, onProgress: @escaping @Sendable (Double) -> Void) async throws {
@@ -68,23 +214,24 @@ actor LocalLLMService {
             return
         }
 
-        // 限制 MLX GPU 缓存上限，防止后台运行被 iOS Jetsam 杀掉
         MLX.GPU.set(cacheLimit: 20 * 1024 * 1024)
 
-        let configuration: ModelConfiguration
-        if let localDir = localCachedDirectory(for: model) {
-            // ✅ 本地已存在完整权重：直接传入本地目录 URL，0 网络请求、无需 VPN 秒加载
-            configuration = ModelConfiguration(directory: localDir)
-            onProgress(0.5)
+        let localDir: URL
+        if let cached = localCachedDirectory(for: model) {
+            localDir = cached
+            onProgress(0.6)
         } else {
-            // 首次下载：使用镜像站环境变量拉取
-            configuration = ModelConfiguration(id: model.rawValue)
+            if let caches = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first {
+                try? FileManager.default.removeItem(at: caches.appendingPathComponent("huggingface"))
+            }
+            localDir = try await downloadModelDirectly(model, onProgress: onProgress)
         }
 
+        let configuration = ModelConfiguration(directory: localDir)
         let container = try await LLMModelFactory.shared.loadContainer(
             configuration: configuration
         ) { progress in
-            onProgress(progress.fractionCompleted)
+            onProgress(0.9 + progress.fractionCompleted * 0.1)
         }
 
         self.loadedContainer = container
