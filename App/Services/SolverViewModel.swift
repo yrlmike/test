@@ -21,8 +21,6 @@ final class SolverViewModel: ObservableObject {
 
     private var listener: NWListener?
     private var currentTask: Task<Void, Never>?
-    
-    // ✅ 新增：记录上一次出答案的时间，用于实现“停留冷却”
     private var lastAnswerTime: Date = .distantPast
 
     var selectedLocalModel: LocalLLMService.AvailableModel {
@@ -44,33 +42,45 @@ final class SolverViewModel: ObservableObject {
         do {
             let params = NWParameters.tcp
             params.allowLocalEndpointReuse = true
-            let port = NWEndpoint.Port(rawValue: AppGroup.localPort)!
+            let port = NWEndpoint.Port(rawValue: 45678)! // 确保端口与扩展一致
             let newListener = try NWListener(using: params, on: port)
 
             newListener.newConnectionHandler = { connection in
                 connection.start(queue: .global(qos: .userInitiated))
                 connection.receive(minimumIncompleteLength: 1, maximumLength: 65536) { data, _, _, _ in
-                    defer { connection.cancel() }
                     guard let data = data,
-                          let rawString = String(data: data, encoding: .utf8) else { return }
+                          let rawString = String(data: data, encoding: .utf8) else {
+                        connection.cancel()
+                        return
+                    }
 
                     let parts = rawString.components(separatedBy: "\r\n\r\n")
                     let bodyText = (parts.count > 1 ? parts.dropFirst().joined(separator: "\r\n\r\n") : "")
                         .trimmingCharacters(in: .whitespacesAndNewlines)
 
-                    let response = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK"
-                    connection.send(content: response.data(using: .utf8), completion: .contentProcessed({ _ in }))
+                    guard !bodyText.isEmpty else {
+                        connection.cancel()
+                        return
+                    }
 
-                    guard !bodyText.isEmpty else { return }
                     Task { @MainActor in
                         let vm = SolverViewModel.shared
                         let now = Date()
                         
-                        // ✅ 拦截 1：如果正在思考中，忽略新请求，防止模型被频繁打断
-                        guard !vm.isThinking else { return }
-                        
-                        // ✅ 拦截 2：冷却期（3 秒）。出答案后的 3 秒内无视任何扫描结果，让答案在屏幕上停留
-                        guard now.timeIntervalSince(vm.lastAnswerTime) > 3.0 else { return }
+                        // 拦截：如果是思考中或者处于 5 秒冷却期内，返回 429 拒绝请求
+                        if vm.isThinking || now.timeIntervalSince(vm.lastAnswerTime) < 3.0 {
+                            let response = "HTTP/1.1 429 Too Many Requests\r\n\r\n"
+                            connection.send(content: response.data(using: .utf8), completion: .contentProcessed({ _ in 
+                                connection.cancel() 
+                            }))
+                            return
+                        }
+
+                        // 允许接收，返回 200 OK
+                        let response = "HTTP/1.1 200 OK\r\n\r\n"
+                        connection.send(content: response.data(using: .utf8), completion: .contentProcessed({ _ in 
+                            connection.cancel() 
+                        }))
 
                         vm.recognizedQuestion = bodyText
                         vm.solve(question: bodyText)
@@ -146,7 +156,6 @@ final class SolverViewModel: ObservableObject {
                 
                 self.isThinking = false
                 self.answerText = result
-                // ✅ 出答案的瞬间，重置计时器，开启 5 秒冷却停留锁
                 self.lastAnswerTime = Date()
                 PiPManager.shared.updateText(result)
                 
@@ -156,7 +165,6 @@ final class SolverViewModel: ObservableObject {
                 self.isThinking = false
                 let errMsg = "❌ 推理出错: \(error.localizedDescription)"
                 self.answerText = errMsg
-                // ✅ 哪怕是报错，也给它停留 5 秒，防止屏幕疯狂闪烁报错
                 self.lastAnswerTime = Date()
                 PiPManager.shared.updateText(errMsg)
             }
