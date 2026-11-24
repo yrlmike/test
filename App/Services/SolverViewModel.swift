@@ -69,7 +69,7 @@ final class SolverViewModel: ObservableObject {
                         // ✅ 拦截 1：如果正在思考中，忽略新请求，防止模型被频繁打断
                         guard !vm.isThinking else { return }
                         
-                        // ✅ 拦截 2：冷却期（5 秒）。出答案后的 5 秒内无视任何扫描结果，让答案在屏幕上停留
+                        // ✅ 拦截 2：冷却期（3 秒）。出答案后的 3 秒内无视任何扫描结果，让答案在屏幕上停留
                         guard now.timeIntervalSince(vm.lastAnswerTime) > 3.0 else { return }
 
                         vm.recognizedQuestion = bodyText
