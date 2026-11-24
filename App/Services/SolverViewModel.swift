@@ -21,6 +21,9 @@ final class SolverViewModel: ObservableObject {
 
     private var listener: NWListener?
     private var currentTask: Task<Void, Never>?
+    
+    // ✅ 新增：记录上一次出答案的时间，用于实现“停留冷却”
+    private var lastAnswerTime: Date = .distantPast
 
     var selectedLocalModel: LocalLLMService.AvailableModel {
         get { LocalLLMService.AvailableModel(rawValue: selectedLocalModelRaw) ?? .qwen1_5B }
@@ -28,11 +31,9 @@ final class SolverViewModel: ObservableObject {
     }
 
     private init() {
-        // 注入国内镜像站地址，首次下载新模型也无需 VPN
         setenv("HF_ENDPOINT", "https://hf-mirror.com", 1)
         startLocalServer()
 
-        // 若开启了本地模型且硬盘里已下载缓存，启动时自动静默载入内存，免去每次手动点击
         if useLocalMLX, LocalLLMService.shared.localCachedDirectory(for: selectedLocalModel) != nil {
             preloadLocalModel()
         }
@@ -62,8 +63,17 @@ final class SolverViewModel: ObservableObject {
 
                     guard !bodyText.isEmpty else { return }
                     Task { @MainActor in
-                        SolverViewModel.shared.recognizedQuestion = bodyText
-                        SolverViewModel.shared.solve(question: bodyText)
+                        let vm = SolverViewModel.shared
+                        let now = Date()
+                        
+                        // ✅ 拦截 1：如果正在思考中，忽略新请求，防止模型被频繁打断
+                        guard !vm.isThinking else { return }
+                        
+                        // ✅ 拦截 2：冷却期（5 秒）。出答案后的 5 秒内无视任何扫描结果，让答案在屏幕上停留
+                        guard now.timeIntervalSince(vm.lastAnswerTime) > 3.0 else { return }
+
+                        vm.recognizedQuestion = bodyText
+                        vm.solve(question: bodyText)
                     }
                 }
             }
@@ -133,14 +143,21 @@ final class SolverViewModel: ObservableObject {
                 }
 
                 guard !Task.isCancelled else { return }
+                
                 self.isThinking = false
                 self.answerText = result
+                // ✅ 出答案的瞬间，重置计时器，开启 5 秒冷却停留锁
+                self.lastAnswerTime = Date()
                 PiPManager.shared.updateText(result)
+                
             } catch {
                 guard !Task.isCancelled else { return }
+                
                 self.isThinking = false
                 let errMsg = "❌ 推理出错: \(error.localizedDescription)"
                 self.answerText = errMsg
+                // ✅ 哪怕是报错，也给它停留 5 秒，防止屏幕疯狂闪烁报错
+                self.lastAnswerTime = Date()
                 PiPManager.shared.updateText(errMsg)
             }
         }
