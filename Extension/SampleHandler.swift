@@ -12,11 +12,6 @@ class SampleHandler: RPBroadcastSampleHandler {
 
     override func broadcastStarted(withSetupInfo setupInfo: [String: NSObject]?) {
         lastSentText = ""
-        AppGroup.writeStatus("录屏已开启，正在监测屏幕...")
-    }
-
-    override func broadcastFinished() {
-        AppGroup.writeStatus("录屏已结束")
     }
 
     override func processSampleBuffer(_ sampleBuffer: CMSampleBuffer, with sampleBufferType: RPSampleBufferType) {
@@ -54,7 +49,6 @@ class SampleHandler: RPBroadcastSampleHandler {
                   err == nil,
                   let observations = req.results as? [VNRecognizedTextObservation] else { return }
 
-            // 如果悬浮窗正处于“正在思考”阶段，暂缓新采样，避免打断当前推理
             let rawLines = observations
                 .sorted { $0.boundingBox.midY > $1.boundingBox.midY }
                 .compactMap { $0.topCandidates(1).first?.string }
@@ -63,7 +57,6 @@ class SampleHandler: RPBroadcastSampleHandler {
                 return
             }
 
-            // 逐行剔除悬浮窗自身的状态提示行，只保留真实的题目内容
             let ignoredSubstrings = [
                 "等待识别屏幕题目",
                 "识别内容：",
@@ -78,17 +71,14 @@ class SampleHandler: RPBroadcastSampleHandler {
             }
 
             let fullText = cleanLines.joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
-
-            // 过滤掉无意义的短字符
             guard fullText.count >= 3 else { return }
 
-            // 防抖去重：若题目内容未变化，不重复触发
             if self.isSimilar(fullText, to: self.lastSentText) {
                 return
             }
 
-            self.lastSentText = fullText
-            AppGroup.writeQuestion(fullText)
+            // 发送给本地主 App
+            self.sendToHostApp(text: fullText)
         }
 
         request.recognitionLevel = .accurate
@@ -108,5 +98,21 @@ class SampleHandler: RPBroadcastSampleHandler {
         let intersection = setA.intersection(setB).count
         let union = max(setA.union(setB).count, 1)
         return Double(intersection) / Double(union) > 0.85
+    }
+
+    private func sendToHostApp(text: String) {
+        guard let url = URL(string: "http://127.0.0.1:45678") else { return }
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.timeoutInterval = 1.0
+        request.httpBody = text.data(using: .utf8)
+        
+        let task = URLSession.shared.dataTask(with: request) { [weak self] data, response, error in
+            // 核心修复：只有主 App 处理了这道题，才把它写进防抖黑名单
+            if let httpResp = response as? HTTPURLResponse, httpResp.statusCode == 200 {
+                self?.lastSentText = text
+            }
+        }
+        task.resume()
     }
 }
