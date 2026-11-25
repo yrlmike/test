@@ -49,42 +49,67 @@ class SampleHandler: RPBroadcastSampleHandler {
                   err == nil,
                   let observations = req.results as? [VNRecognizedTextObservation] else { return }
 
-            let rawLines = observations
-                .sorted { $0.boundingBox.midY > $1.boundingBox.midY }
-                .compactMap { $0.topCandidates(1).first?.string }
+            // ✅ 步骤 1：按照 Y 轴从上到下初步排序 (midY 越大越靠屏幕上方)
+            let sortedObs = observations.sorted { $0.boundingBox.midY > $1.boundingBox.midY }
 
-            if rawLines.contains(where: { $0.contains("正在思考") }) {
+            // 拦截画中画自带提示音，防止自循环
+            if sortedObs.compactMap({ $0.topCandidates(1).first?.string }).contains(where: { $0.contains("正在思考") }) {
                 return
             }
 
+            // ✅ 步骤 2：核心修复 —— 二维聚类重组 (Y轴容差成行，X轴横向排序)
+            var lines: [[VNRecognizedTextObservation]] = []
+            let yTolerance: CGFloat = 0.015 // 容许 1.5% 屏幕高度的误差，将由于排版错开的一排选项合并为同一行
+
+            for obs in sortedObs {
+                if lines.isEmpty {
+                    lines.append([obs])
+                } else {
+                    let lastLineIndex = lines.count - 1
+                    if let anchor = lines[lastLineIndex].first, abs(anchor.boundingBox.midY - obs.boundingBox.midY) <= yTolerance {
+                        // 属于同一行，塞进最后一个数组
+                        lines[lastLineIndex].append(obs)
+                    } else {
+                        // 换新行
+                        lines.append([obs])
+                    }
+                }
+            }
+
+            // ✅ 步骤 3：每一行内部按 X 轴从左到右排序，并用空格拼起来 (解决 A. 与 华法林 断裂问题)
+            var rawLines: [String] = []
+            for line in lines {
+                let sortedLine = line.sorted { $0.boundingBox.minX < $1.boundingBox.minX }
+                let lineText = sortedLine.compactMap { $0.topCandidates(1).first?.string }.joined(separator: " ")
+                rawLines.append(lineText)
+            }
+
+            // 过滤无用杂音
             let ignoredSubstrings = [
-                "等待识别屏幕题目",
-                "识别内容：",
-                "本地模型",
-                "已就绪",
-                "正在离线载入",
-                "推理出错",
-                "Qwen2.5"
+                "等待识别屏幕题目", "识别内容：", "本地模型", "已就绪",
+                "正在离线载入", "推理出错", "Qwen2.5", "ks.wjx.com", "三基考试"
             ]
             let cleanLines = rawLines.filter { line in
-                !ignoredSubstrings.contains(where: { line.contains($0) })
+                let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+                if trimmed == "提交" || trimmed == "上一页" || trimmed == "下一页" { return false }
+                return !ignoredSubstrings.contains(where: { trimmed.contains($0) })
             }
 
             let fullText = cleanLines.joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
-            guard fullText.count >= 3 else { return }
+            guard fullText.count >= 6 else { return }
 
             if self.isSimilar(fullText, to: self.lastSentText) {
                 return
             }
 
-            // 发送给本地主 App
             self.sendToHostApp(text: fullText)
         }
 
         request.recognitionLevel = .accurate
         request.recognitionLanguages = ["zh-Hans", "en-US"]
         request.usesLanguageCorrection = true
-        request.regionOfInterest = CGRect(x: 0.0, y: 0.0, width: 1.0, height: 0.935)
+        // 裁掉屏幕最顶部12% (状态栏和网页标题)，只扫中间及下方题目区域
+        request.regionOfInterest = CGRect(x: 0.0, y: 0.0, width: 1.0, height: 0.88)
 
         let handler = VNImageRequestHandler(cgImage: cgImage, options: [:])
         try? handler.perform([request])
@@ -97,7 +122,7 @@ class SampleHandler: RPBroadcastSampleHandler {
         let setB = Set(b)
         let intersection = setA.intersection(setB).count
         let union = max(setA.union(setB).count, 1)
-        return Double(intersection) / Double(union) > 0.85
+        return Double(intersection) / Double(union) > 0.78
     }
 
     private func sendToHostApp(text: String) {
@@ -106,9 +131,8 @@ class SampleHandler: RPBroadcastSampleHandler {
         request.httpMethod = "POST"
         request.timeoutInterval = 1.0
         request.httpBody = text.data(using: .utf8)
-        
-        let task = URLSession.shared.dataTask(with: request) { [weak self] data, response, error in
-            // 核心修复：只有主 App 处理了这道题，才把它写进防抖黑名单
+
+        let task = URLSession.shared.dataTask(with: request) { [weak self] _, response, _ in
             if let httpResp = response as? HTTPURLResponse, httpResp.statusCode == 200 {
                 self?.lastSentText = text
             }
