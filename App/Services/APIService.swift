@@ -10,7 +10,8 @@ final class APIService {
         var modelName: String
     }
 
-    func ask(question: String, config: Config) async throws -> String {
+    // ✅ 新增 systemPrompt 参数
+    func ask(question: String, systemPrompt: String, config: Config) async throws -> String {
         let trimmedBase = config.baseURL.trimmingCharacters(in: .whitespacesAndNewlines)
             .trimmingCharacters(in: CharacterSet(charactersIn: "/"))
         guard let url = URL(string: "\(trimmedBase)/chat/completions") else {
@@ -24,18 +25,15 @@ final class APIService {
 
         let cleanModel = config.modelName.trimmingCharacters(in: .whitespacesAndNewlines)
 
-        // 将规则直接合并到 user 消息中，避免部分 MaaS 模型拒绝 system 角色
+        // ✅ 将前端的自定义提示词融合到请求里
         let combinedPrompt = """
-        你是一个手机悬浮窗极速答题助手。根据以下屏幕识别出的文本作答：
-        1. 严禁使用任何 Markdown 格式符号（不要出现 **、*、#、`、- 等符号），只输出纯文本。
-        2. 第一行直接给出最终核心答案（单选写【单选】X，多选写【多选】XXXX），独占一行。
-        3. 第二行起用不超过 2 句话说明关键原因，总字数严格控制在 70 字以内，不要客套话或重复题目。
+        \(systemPrompt)
 
+        ==========
         屏幕识别内容：
         \(question)
         """
 
-        // 精简请求体，仅保留所有模型 100% 兼容的 model 与 messages 字段
         let payload: [String: Any] = [
             "model": cleanModel,
             "messages": [
@@ -65,13 +63,6 @@ final class APIService {
             throw NSError(domain: "APIService", code: -3, userInfo: [NSLocalizedDescriptionKey: "无法解析模型返回内容"])
         }
 
-        let cleaned = content
-            .replacingOccurrences(of: "**", with: "")
-            .replacingOccurrences(of: "### ", with: "")
-            .replacingOccurrences(of: "## ", with: "")
-            .replacingOccurrences(of: "# ", with: "")
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-
-        return cleaned
+        return content.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 }
