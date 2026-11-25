@@ -1,7 +1,20 @@
 import SwiftUI
+import ReplayKit // 导入 ReplayKit 以使用原生录屏弹窗
+
+// ✅ 新增：原生屏幕广播选择器视图
+struct BroadcastPickerView: UIViewRepresentable {
+    func makeUIView(context: Context) -> UIView {
+        let pickerView = RPSystemBroadcastPickerView(frame: CGRect(x: 0, y: 0, width: 44, height: 44))
+        pickerView.showsMicrophoneButton = false
+        // 注意：如果你的广播扩展 Target 的 Bundle ID 不是默认的，可以取消下面这行的注释并填入你的扩展 Bundle ID
+        // pickerView.preferredExtension = "com.yourname.ScreenSolver.Extension" 
+        return pickerView
+    }
+
+    func updateUIView(_ uiView: UIView, context: Context) {}
+}
 
 struct ContentView: View {
-    // === 核心状态变量 (存储在 AppStorage 中，重签不丢数据) ===
     @AppStorage("useLocalMLX") var useLocalMLX: Bool = false
     @AppStorage("selectedLocalModel") var selectedLocalModel: String = "mlx-community/Qwen2.5-1.5B-Instruct-4bit"
     
@@ -16,7 +29,7 @@ struct ContentView: View {
     2. 按屏幕从上到下的顺序，识别出所有【题干和选项都完整】的题目，逐题输出答案，每题占一行。
     3. 每行严格按此格式：「题干前4~6个核心字：选项字母」（例如：抗酸剂监护：ABCD）。
     4. 屏幕最上方或最下方若有残缺题目，直接忽略。
-    5. 解析越短越好，确保3秒内一眼看清所有选项。
+    5. 绝不要写任何解析，确保3秒内一眼看清所有选项。
     """
 
     @StateObject private var viewModel = SolverViewModel.shared
@@ -24,7 +37,6 @@ struct ContentView: View {
     var body: some View {
         NavigationView {
             Form {
-                // 1. 云端模型配置
                 Section(header: Text("云端大模型设置")) {
                     Toggle("优先使用本地 MLX 离线模型", isOn: $useLocalMLX)
                     
@@ -43,7 +55,6 @@ struct ContentView: View {
                     }
                 }
 
-                // 2. 本地离线模型配置
                 if useLocalMLX {
                     Section(header: Text("本地 MLX 模型设置"), footer: Text("首次加载会自动下载，保存至 Documents 目录，不占用 iCloud 空间且永久保留。")) {
                         Picker("选择模型", selection: $selectedLocalModel) {
@@ -58,6 +69,7 @@ struct ContentView: View {
                                 .font(.caption)
                                 .foregroundColor(.gray)
                         } else {
+                            // 这里修复了无法点击的问题
                             Button("点击预加载 / 检查模型") {
                                 viewModel.preloadLocalModel()
                             }
@@ -65,12 +77,12 @@ struct ContentView: View {
                     }
                 }
                 
-                // 3. 提示词动态配置
                 Section(header: Text("自定义提示词 (即时生效)")) {
                     TextEditor(text: $customPrompt)
                         .frame(height: 180)
                         .font(.system(size: 14))
                     
+                    // 这里修复了无法点击的问题
                     Button("恢复默认指令") {
                         customPrompt = """
                         你是一个手机悬浮窗极速答题助手。用户发来的是考试页面文本（同屏可能包含1到3道连续的选择题）。
@@ -79,32 +91,42 @@ struct ContentView: View {
                         2. 按屏幕从上到下的顺序，识别出所有【题干和选项都完整】的题目，逐题输出答案，每题占一行。
                         3. 每行严格按此格式：「题干前4~6个核心字：选项字母」（例如：抗酸剂监护：ABCD）。
                         4. 屏幕最上方或最下方若有残缺题目，直接忽略。
-                        5. 解析越短越好，确保3秒内一眼看清所有选项。
+                        5. 绝不要写任何解析，确保3秒内一眼看清所有选项。
                         """
                     }
                     .foregroundColor(.red)
                 }
                 
-                // 4. 画中画功能控制
                 Section(header: Text("画中画与录屏")) {
+                    // 第一步：开启画中画
                     Button(action: {
                         PiPManager.shared.startPiP()
                     }) {
-                        Text("开启画中画悬浮窗")
+                        Text("第一步：开启画中画悬浮窗")
                             .bold()
                             .frame(maxWidth: .infinity, alignment: .center)
                     }
                     
-                    Text("提示: 开启画中画后，请在控制中心长按“屏幕录制”按钮，选择 ScreenSolver 扩展开始答题。")
-                        .font(.footnote)
-                        .foregroundColor(.gray)
+                    // 第二步：原生录屏呼出按钮
+                    HStack {
+                        Spacer()
+                        VStack(spacing: 8) {
+                            Text("第二步：点击下方黑圈启动屏幕识别")
+                                .font(.subheadline)
+                                .foregroundColor(.primary)
+                            
+                            // 这个就是弹出的原生的录屏选择器
+                            BroadcastPickerView()
+                                .frame(width: 44, height: 44)
+                        }
+                        Spacer()
+                    }
+                    .padding(.vertical, 8)
                 }
             }
             .navigationTitle("ScreenSolver")
-            .onTapGesture {
-                // 点击空白处收起键盘
-                UIApplication.shared.sendAction(#selector(UIResponder.resignFirstResponder), to: nil, from: nil, for: nil)
-            }
+            // ✅ 修复方案：移除拦截手势的 onTapGesture，改用 iOS 16+ 的原生滑动收起键盘
+            .scrollDismissesKeyboard(.immediately) 
         }
     }
 }
