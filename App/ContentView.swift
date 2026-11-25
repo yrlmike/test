@@ -2,11 +2,16 @@ import SwiftUI
 import ReplayKit
 import AVFoundation
 
-// 原生屏幕广播选择器视图
+// 原生屏幕广播选择器视图 (用于触发录屏)
 struct BroadcastPickerView: UIViewRepresentable {
     func makeUIView(context: Context) -> UIView {
         let pickerView = RPSystemBroadcastPickerView(frame: CGRect(x: 0, y: 0, width: 44, height: 44))
         pickerView.showsMicrophoneButton = false
+        
+        // 强烈建议：将下方的字符串换成你 project.yml 里的 Extension Bundle ID
+        // 这样点击录屏按钮时，就能直接默认选中你的扩展，不用从列表里找了
+        pickerView.preferredExtension = "com.screensolver.app.ScreenSolverExtension"
+        
         return pickerView
     }
     func updateUIView(_ uiView: UIView, context: Context) {}
@@ -44,8 +49,12 @@ struct ContentView: View {
                     }) {
                         Text("1. 开启画中画悬浮窗")
                             .bold()
-                            .frame(maxWidth: .infinity, alignment: .center)
+                            // ✅ 修复：让按钮撑满整行，并扩大点击热区
+                            .frame(maxWidth: .infinity, minHeight: 44)
+                            .contentShape(Rectangle())
                     }
+                    // ✅ 修复：防止 Form 内部的按钮被局部事件拦截
+                    .buttonStyle(.borderless)
                     
                     HStack {
                         Spacer()
@@ -63,7 +72,7 @@ struct ContentView: View {
                 }
 
                 // ==========================================
-                // 二、实时识别内容与结果 (恢复原有的查看区域)
+                // 二、实时识别内容与结果
                 // ==========================================
                 Section(header: Text("第二步：实时运行状态")) {
                     VStack(alignment: .leading, spacing: 8) {
@@ -84,7 +93,7 @@ struct ContentView: View {
                             .font(.system(size: 13))
                             .foregroundColor(.secondary)
                             .frame(maxWidth: .infinity, alignment: .leading)
-                            .lineLimit(6) // 限制行数防止占用太大屏幕
+                            .lineLimit(6)
                     }
                     .padding(.vertical, 4)
                 }
@@ -125,9 +134,15 @@ struct ContentView: View {
                             Text(String(format: "正在下载或加载: %.1f%%", viewModel.modelDownloadProgress * 100))
                                 .font(.caption).foregroundColor(.gray)
                         } else {
-                            Button("点击预加载 / 检查模型") {
+                            Button(action: {
                                 viewModel.preloadLocalModel()
+                            }) {
+                                Text("点击预加载 / 检查模型")
+                                    // ✅ 修复：扩大点击热区
+                                    .frame(maxWidth: .infinity, minHeight: 44, alignment: .leading)
+                                    .contentShape(Rectangle())
                             }
+                            .buttonStyle(.borderless)
                         }
                     }
                 }
@@ -140,7 +155,7 @@ struct ContentView: View {
                         .frame(height: 150)
                         .font(.system(size: 13))
                     
-                    Button("恢复默认指令") {
+                    Button(action: {
                         customPrompt = """
                         你是一个手机悬浮窗极速答题助手。用户发来的是考试页面文本（同屏可能包含1到3道连续的选择题）。
                         请严格遵守以下规则：
@@ -150,14 +165,26 @@ struct ContentView: View {
                         4. 屏幕最上方或最下方若有残缺题目，直接忽略。
                         5. 绝不要写任何解析，确保3秒内一眼看清所有选项。
                         """
+                    }) {
+                        Text("恢复默认指令")
+                            // ✅ 修复：扩大点击热区
+                            .frame(maxWidth: .infinity, minHeight: 44, alignment: .center)
+                            .contentShape(Rectangle())
                     }
+                    .buttonStyle(.borderless)
                     .foregroundColor(.red)
                 }
             }
             .navigationTitle("ScreenSolver")
-            .scrollDismissesKeyboard(.immediately) // 解决输入框导致按键失效的问题
+            // ✅ iOS 原生机制：滑动页面即可收起键盘，不再吞噬按钮点击事件
+            .scrollDismissesKeyboard(.immediately) 
+            .background(
+                // ✅ 修复：如果你之前的代码里有用于画中画的隐藏视图层 (比如 PlayerView)，必须挂载在这里
+                // 如果没有，这行代码不会有任何负面影响。
+                Color.clear 
+            )
             .onAppear {
-                // 确保音频会话激活，这是 iOS 画中画弹出的硬性前提条件
+                // ✅ 修复：画中画硬性前置条件：必须激活音频会话，否则画中画引擎会直接拒绝启动
                 try? AVAudioSession.sharedInstance().setCategory(.playback, mode: .default, options: .mixWithOthers)
                 try? AVAudioSession.sharedInstance().setActive(true)
             }
