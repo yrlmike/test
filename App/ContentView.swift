@@ -1,20 +1,20 @@
 import SwiftUI
-import ReplayKit // 导入 ReplayKit 以使用原生录屏弹窗
+import ReplayKit
+import AVFoundation
 
-// ✅ 新增：原生屏幕广播选择器视图
+// 原生屏幕广播选择器视图
 struct BroadcastPickerView: UIViewRepresentable {
     func makeUIView(context: Context) -> UIView {
         let pickerView = RPSystemBroadcastPickerView(frame: CGRect(x: 0, y: 0, width: 44, height: 44))
         pickerView.showsMicrophoneButton = false
-        // 注意：如果你的广播扩展 Target 的 Bundle ID 不是默认的，可以取消下面这行的注释并填入你的扩展 Bundle ID
-        // pickerView.preferredExtension = "com.yourname.ScreenSolver.Extension" 
         return pickerView
     }
-
     func updateUIView(_ uiView: UIView, context: Context) {}
 }
 
 struct ContentView: View {
+    @StateObject private var viewModel = SolverViewModel.shared
+
     @AppStorage("useLocalMLX") var useLocalMLX: Bool = false
     @AppStorage("selectedLocalModel") var selectedLocalModel: String = "mlx-community/Qwen2.5-1.5B-Instruct-4bit"
     
@@ -32,11 +32,66 @@ struct ContentView: View {
     5. 绝不要写任何解析，确保3秒内一眼看清所有选项。
     """
 
-    @StateObject private var viewModel = SolverViewModel.shared
-
     var body: some View {
         NavigationView {
             Form {
+                // ==========================================
+                // 一、画中画与录屏 (最上面)
+                // ==========================================
+                Section(header: Text("第一步：启动服务")) {
+                    Button(action: {
+                        PiPManager.shared.startPiP()
+                    }) {
+                        Text("1. 开启画中画悬浮窗")
+                            .bold()
+                            .frame(maxWidth: .infinity, alignment: .center)
+                    }
+                    
+                    HStack {
+                        Spacer()
+                        VStack(spacing: 8) {
+                            Text("2. 点击下方黑圈启动屏幕识别")
+                                .font(.subheadline)
+                                .foregroundColor(.primary)
+                            
+                            BroadcastPickerView()
+                                .frame(width: 44, height: 44)
+                        }
+                        Spacer()
+                    }
+                    .padding(.vertical, 4)
+                }
+
+                // ==========================================
+                // 二、实时识别内容与结果 (恢复原有的查看区域)
+                // ==========================================
+                Section(header: Text("第二步：实时运行状态")) {
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text("大模型最新解答：")
+                            .font(.caption)
+                            .foregroundColor(.gray)
+                        Text(viewModel.answerText)
+                            .font(.system(size: 15, weight: .bold))
+                            .foregroundColor(.blue)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                        
+                        Divider().padding(.vertical, 4)
+                        
+                        Text("屏幕 OCR 提取文本：")
+                            .font(.caption)
+                            .foregroundColor(.gray)
+                        Text(viewModel.recognizedQuestion.isEmpty ? "等待识别中..." : viewModel.recognizedQuestion)
+                            .font(.system(size: 13))
+                            .foregroundColor(.secondary)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .lineLimit(6) // 限制行数防止占用太大屏幕
+                    }
+                    .padding(.vertical, 4)
+                }
+
+                // ==========================================
+                // 三、云端大模型设置
+                // ==========================================
                 Section(header: Text("云端大模型设置")) {
                     Toggle("优先使用本地 MLX 离线模型", isOn: $useLocalMLX)
                     
@@ -55,21 +110,21 @@ struct ContentView: View {
                     }
                 }
 
+                // ==========================================
+                // 四、本地 MLX 模型设置
+                // ==========================================
                 if useLocalMLX {
-                    Section(header: Text("本地 MLX 模型设置"), footer: Text("首次加载会自动下载，保存至 Documents 目录，不占用 iCloud 空间且永久保留。")) {
+                    Section(header: Text("本地 MLX 模型设置")) {
                         Picker("选择模型", selection: $selectedLocalModel) {
-                            Text("Qwen2.5-1.5B (极速版 ~900MB)").tag("mlx-community/Qwen2.5-1.5B-Instruct-4bit")
-                            Text("Qwen2.5-3B (高精版 ~1.8GB)").tag("mlx-community/Qwen2.5-3B-Instruct-4bit")
+                            Text("Qwen2.5-1.5B (极速版)").tag("mlx-community/Qwen2.5-1.5B-Instruct-4bit")
+                            Text("Qwen2.5-3B (高精版)").tag("mlx-community/Qwen2.5-3B-Instruct-4bit")
                         }
                         
                         if viewModel.isDownloadingModel {
                             ProgressView(value: viewModel.modelDownloadProgress, total: 1.0)
-                                .progressViewStyle(LinearProgressViewStyle())
                             Text(String(format: "正在下载或加载: %.1f%%", viewModel.modelDownloadProgress * 100))
-                                .font(.caption)
-                                .foregroundColor(.gray)
+                                .font(.caption).foregroundColor(.gray)
                         } else {
-                            // 这里修复了无法点击的问题
                             Button("点击预加载 / 检查模型") {
                                 viewModel.preloadLocalModel()
                             }
@@ -77,12 +132,14 @@ struct ContentView: View {
                     }
                 }
                 
+                // ==========================================
+                // 五、自定义提示词
+                // ==========================================
                 Section(header: Text("自定义提示词 (即时生效)")) {
                     TextEditor(text: $customPrompt)
-                        .frame(height: 180)
-                        .font(.system(size: 14))
+                        .frame(height: 150)
+                        .font(.system(size: 13))
                     
-                    // 这里修复了无法点击的问题
                     Button("恢复默认指令") {
                         customPrompt = """
                         你是一个手机悬浮窗极速答题助手。用户发来的是考试页面文本（同屏可能包含1到3道连续的选择题）。
@@ -96,37 +153,14 @@ struct ContentView: View {
                     }
                     .foregroundColor(.red)
                 }
-                
-                Section(header: Text("画中画与录屏")) {
-                    // 第一步：开启画中画
-                    Button(action: {
-                        PiPManager.shared.startPiP()
-                    }) {
-                        Text("第一步：开启画中画悬浮窗")
-                            .bold()
-                            .frame(maxWidth: .infinity, alignment: .center)
-                    }
-                    
-                    // 第二步：原生录屏呼出按钮
-                    HStack {
-                        Spacer()
-                        VStack(spacing: 8) {
-                            Text("第二步：点击下方黑圈启动屏幕识别")
-                                .font(.subheadline)
-                                .foregroundColor(.primary)
-                            
-                            // 这个就是弹出的原生的录屏选择器
-                            BroadcastPickerView()
-                                .frame(width: 44, height: 44)
-                        }
-                        Spacer()
-                    }
-                    .padding(.vertical, 8)
-                }
             }
             .navigationTitle("ScreenSolver")
-            // ✅ 修复方案：移除拦截手势的 onTapGesture，改用 iOS 16+ 的原生滑动收起键盘
-            .scrollDismissesKeyboard(.immediately) 
+            .scrollDismissesKeyboard(.immediately) // 解决输入框导致按键失效的问题
+            .onAppear {
+                // 确保音频会话激活，这是 iOS 画中画弹出的硬性前提条件
+                try? AVAudioSession.sharedInstance().setCategory(.playback, mode: .default, options: .mixWithOthers)
+                try? AVAudioSession.sharedInstance().setActive(true)
+            }
         }
     }
 }
