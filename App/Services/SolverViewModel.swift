@@ -15,8 +15,8 @@ final class SolverViewModel: ObservableObject {
     @AppStorage("apiBaseURL") var apiBaseURL: String = "https://tokenhub.tencentmaas.com/v1"
     @AppStorage("apiKey") var apiKey: String = ""
     @AppStorage("apiModelName") var apiModelName: String = "kimi-k3.1-pro"
-    
-    // ✅ 新增：自定义提示词配置，设定默认值
+
+    // 自定义提示词配置，设定默认值
     @AppStorage("customPrompt") var customPrompt: String = """
     你是一个手机悬浮窗极速答题助手。用户发来的是考试页面文本（同屏可能包含1到3道连续的选择题）。
     请严格遵守以下规则：
@@ -76,18 +76,18 @@ final class SolverViewModel: ObservableObject {
                     Task { @MainActor in
                         let vm = SolverViewModel.shared
                         let now = Date()
-                        
+
                         if vm.isThinking || now.timeIntervalSince(vm.lastAnswerTime) < 5.0 {
                             let response = "HTTP/1.1 429 Too Many Requests\r\n\r\n"
-                            connection.send(content: response.data(using: .utf8), completion: .contentProcessed({ _ in 
-                                connection.cancel() 
+                            connection.send(content: response.data(using: .utf8), completion: .contentProcessed({ _ in
+                                connection.cancel()
                             }))
                             return
                         }
 
                         let response = "HTTP/1.1 200 OK\r\n\r\n"
-                        connection.send(content: response.data(using: .utf8), completion: .contentProcessed({ _ in 
-                            connection.cancel() 
+                        connection.send(content: response.data(using: .utf8), completion: .contentProcessed({ _ in
+                            connection.cancel()
                         }))
 
                         vm.recognizedQuestion = bodyText
@@ -102,7 +102,29 @@ final class SolverViewModel: ObservableObject {
         }
     }
 
-    func preloadLocalModel() { /* 保持之前不变 */ }
+    func preloadLocalModel() {
+        isDownloadingModel = true
+        modelDownloadProgress = 0.0
+        answerText = "正在离线载入本地 MLX 模型..."
+        PiPManager.shared.updateText(answerText)
+
+        Task {
+            do {
+                try await LocalLLMService.shared.loadModel(selectedLocalModel) { progress in
+                    Task { @MainActor in
+                        self.modelDownloadProgress = progress
+                    }
+                }
+                self.isDownloadingModel = false
+                self.answerText = "本地模型 \(selectedLocalModel.displayName) 已就绪！"
+                PiPManager.shared.updateText(self.answerText)
+            } catch {
+                self.isDownloadingModel = false
+                self.answerText = "模型加载失败: \(error.localizedDescription)"
+                PiPManager.shared.updateText(self.answerText)
+            }
+        }
+    }
 
     func solve(question: String) {
         currentTask?.cancel()
@@ -115,9 +137,15 @@ final class SolverViewModel: ObservableObject {
             do {
                 let result: String
                 if useLocalMLX || apiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    let combinedLocalInput = """
+                    \(customPrompt)
+
+                    ==========
+                    屏幕识别内容：
+                    \(question)
+                    """
                     result = try await LocalLLMService.shared.answer(
-                        question: question,
-                        systemPrompt: customPrompt, // ✅ 传入前端自定义指令
+                        question: combinedLocalInput,
                         model: selectedLocalModel
                     ) { progress in
                         Task { @MainActor in
@@ -127,7 +155,6 @@ final class SolverViewModel: ObservableObject {
                     }
                 } else {
                     let cfg = APIService.Config(baseURL: apiBaseURL, apiKey: apiKey, modelName: apiModelName)
-                    // ✅ 传入前端自定义指令
                     result = try await APIService.shared.ask(question: question, systemPrompt: customPrompt, config: cfg)
                 }
 
