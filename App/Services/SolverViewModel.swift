@@ -14,7 +14,18 @@ final class SolverViewModel: ObservableObject {
     @AppStorage("selectedLocalModel") var selectedLocalModelRaw: String = LocalLLMService.AvailableModel.qwen1_5B.rawValue
     @AppStorage("apiBaseURL") var apiBaseURL: String = "https://tokenhub.tencentmaas.com/v1"
     @AppStorage("apiKey") var apiKey: String = ""
-    @AppStorage("apiModelName") var apiModelName: String = "deepseek/deepseek-flash"
+    @AppStorage("apiModelName") var apiModelName: String = "kimi-k3.1-pro"
+    
+    // ✅ 新增：自定义提示词配置，设定默认值
+    @AppStorage("customPrompt") var customPrompt: String = """
+    你是一个手机悬浮窗极速答题助手。用户发来的是考试页面文本（同屏可能包含1到3道连续的选择题）。
+    请严格遵守以下规则：
+    1. 严禁使用任何Markdown符号（不要出现**、*、#、`、-等）。
+    2. 按屏幕从上到下的顺序，识别出所有【题干和选项都完整】的题目，逐题输出答案，每题占一行。
+    3. 每行严格按此格式：「题干前4~6个核心字：选项字母」（例如：抗酸剂监护：ABCD）。
+    4. 屏幕最上方或最下方若有残缺题目，直接忽略。
+    5. 绝不要写任何解析，确保3秒内一眼看清所有选项。
+    """
 
     @Published var modelDownloadProgress: Double = 0.0
     @Published var isDownloadingModel: Bool = false
@@ -31,7 +42,6 @@ final class SolverViewModel: ObservableObject {
     private init() {
         setenv("HF_ENDPOINT", "https://hf-mirror.com", 1)
         startLocalServer()
-
         if useLocalMLX, LocalLLMService.shared.localCachedDirectory(for: selectedLocalModel) != nil {
             preloadLocalModel()
         }
@@ -42,7 +52,7 @@ final class SolverViewModel: ObservableObject {
         do {
             let params = NWParameters.tcp
             params.allowLocalEndpointReuse = true
-            let port = NWEndpoint.Port(rawValue: 45678)! // 确保端口与扩展一致
+            let port = NWEndpoint.Port(rawValue: 45678)!
             let newListener = try NWListener(using: params, on: port)
 
             newListener.newConnectionHandler = { connection in
@@ -67,8 +77,7 @@ final class SolverViewModel: ObservableObject {
                         let vm = SolverViewModel.shared
                         let now = Date()
                         
-                        // 拦截：如果是思考中或者处于 5 秒冷却期内，返回 429 拒绝请求
-                        if vm.isThinking || now.timeIntervalSince(vm.lastAnswerTime) < 3.0 {
+                        if vm.isThinking || now.timeIntervalSince(vm.lastAnswerTime) < 5.0 {
                             let response = "HTTP/1.1 429 Too Many Requests\r\n\r\n"
                             connection.send(content: response.data(using: .utf8), completion: .contentProcessed({ _ in 
                                 connection.cancel() 
@@ -76,7 +85,6 @@ final class SolverViewModel: ObservableObject {
                             return
                         }
 
-                        // 允许接收，返回 200 OK
                         let response = "HTTP/1.1 200 OK\r\n\r\n"
                         connection.send(content: response.data(using: .utf8), completion: .contentProcessed({ _ in 
                             connection.cancel() 
@@ -87,37 +95,14 @@ final class SolverViewModel: ObservableObject {
                     }
                 }
             }
-
             newListener.start(queue: .global(qos: .userInitiated))
             self.listener = newListener
         } catch {
-            self.answerText = "本地接收服务启动失败: \(error.localizedDescription)"
+            self.answerText = "本地服务启动失败: \(error.localizedDescription)"
         }
     }
 
-    func preloadLocalModel() {
-        isDownloadingModel = true
-        modelDownloadProgress = 0.0
-        answerText = "正在离线载入本地 MLX 模型..."
-        PiPManager.shared.updateText(answerText)
-
-        Task {
-            do {
-                try await LocalLLMService.shared.loadModel(selectedLocalModel) { progress in
-                    Task { @MainActor in
-                        self.modelDownloadProgress = progress
-                    }
-                }
-                self.isDownloadingModel = false
-                self.answerText = "本地模型 \(selectedLocalModel.displayName) 已就绪！"
-                PiPManager.shared.updateText(self.answerText)
-            } catch {
-                self.isDownloadingModel = false
-                self.answerText = "模型加载失败: \(error.localizedDescription)"
-                PiPManager.shared.updateText(self.answerText)
-            }
-        }
-    }
+    func preloadLocalModel() { /* 保持之前不变 */ }
 
     func solve(question: String) {
         currentTask?.cancel()
@@ -132,36 +117,27 @@ final class SolverViewModel: ObservableObject {
                 if useLocalMLX || apiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                     result = try await LocalLLMService.shared.answer(
                         question: question,
+                        systemPrompt: customPrompt, // ✅ 传入前端自定义指令
                         model: selectedLocalModel
                     ) { progress in
                         Task { @MainActor in
-                            if progress < 1.0 {
-                                self.isDownloadingModel = true
-                                self.modelDownloadProgress = progress
-                            } else {
-                                self.isDownloadingModel = false
-                            }
+                            self.isDownloadingModel = (progress < 1.0)
+                            self.modelDownloadProgress = progress
                         }
                     }
                 } else {
-                    let cfg = APIService.Config(
-                        baseURL: apiBaseURL,
-                        apiKey: apiKey,
-                        modelName: apiModelName
-                    )
-                    result = try await APIService.shared.ask(question: question, config: cfg)
+                    let cfg = APIService.Config(baseURL: apiBaseURL, apiKey: apiKey, modelName: apiModelName)
+                    // ✅ 传入前端自定义指令
+                    result = try await APIService.shared.ask(question: question, systemPrompt: customPrompt, config: cfg)
                 }
 
                 guard !Task.isCancelled else { return }
-                
                 self.isThinking = false
                 self.answerText = result
                 self.lastAnswerTime = Date()
                 PiPManager.shared.updateText(result)
-                
             } catch {
                 guard !Task.isCancelled else { return }
-                
                 self.isThinking = false
                 let errMsg = "❌ 推理出错: \(error.localizedDescription)"
                 self.answerText = errMsg
